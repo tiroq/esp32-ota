@@ -240,6 +240,7 @@ def remove_item(item, tree):
 
 
 def update():
+    wlan = wificonnect()
     print('Updating ota.py to newest version')
     raw_url = 'https://raw.githubusercontent.com/ishamrai/esp32-ota/master/'
     pull('ota.py', raw_url + 'ota.py')
