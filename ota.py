@@ -69,7 +69,7 @@ def pull(f_path, raw_url):
             print('tried to close new_file to save memory durring raw file decode')
 
 
-def pull_all(tree=call_trees_url, raw=raw, ignore=ignore, isconnected=False):
+def pull_all(tree=call_trees_url, raw=raw, ignore=ignore, isconnected=False, reset=False):
     if not isconnected:
         wlan = wificonnect()
     os.chdir('/')
@@ -108,10 +108,11 @@ def pull_all(tree=call_trees_url, raw=raw, ignore=ignore, isconnected=False):
     logfile = open('ota.log', 'w')
     logfile.write(str(log))
     logfile.close()
-    time.sleep(10)
-    print('resetting machine in 10: machine.reset()')
-    machine.reset()
-    # return check instead return with global
+    if reset:
+        time.sleep(10)
+        print('resetting machine in 10: machine.reset()')
+        machine.reset()
+        # return check instead return with global
 
 
 def wificonnect(ssid=ssid, password=password):
