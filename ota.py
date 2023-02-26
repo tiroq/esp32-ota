@@ -6,17 +6,22 @@
 import binascii
 import hashlib
 import json
+import logging
 import os
+import re
 import time
 
-import machine
-import network
-import urequests
+# import machine
+# import network
+try:
+    import urequests
+except ImportError:
+    # In case we are debugging, try to import regular requests lib
+    import requests as urequests
 
 global internal_tree
 
-#### -------------User Variables----------------####
-#### 
+# -------------User Variables---------------- #
 try:
     import secrets
 
@@ -25,8 +30,8 @@ try:
     user = secrets.user
     repository = secrets.repository
     token = secrets.token
-except:
-    # Default Network to connect using wificonnect()
+except ImportError as e:
+    # Default Network to connect
     ssid = "test"
     password = "12345678"
 
@@ -36,224 +41,150 @@ except:
     repository = 'ota_test'
     token = ''
 
-# Don't remove ugit.py from the ignore_files unless you know what you are doing :D
+# Don't remove ota.py from the ignore_files unless you know what you are doing :D
 # Put the files you don't want deleted or updated here use '/filename.ext'
-ignore_files = ['/ota.py', '/secrets.py']
+# ignore_files = ['/ota.py', '/secrets.py']
+ignore_files = ['./ota.py', './secrets.py', r'.idea/.*', 'README.md', 'LICENSE', '.gitignore']
 ignore = ignore_files
-### -----------END OF USER VARIABLES ----------####
-
-# Static URLS
-# GitHub uses 'main' instead of master for python repository trees
-giturl = 'https://github.com/{user}/{repository}'
-call_trees_url = f'https://api.github.com/repos/{user}/{repository}/git/trees/main?recursive=1'
-raw = f'https://raw.githubusercontent.com/{user}/{repository}/master/'
+# -----------END OF USER VARIABLES ---------- #
 
 
-def pull(f_path, raw_url):
-    print(f'pulling {f_path} from github')
-    # files = os.listdir()
+class GitTreeElement:
+    def __init__(self, path, mode, type, sha, url, size=0):
+        self.path = os.path.normpath(path)
+        self.mode = mode
+        self.type = type
+        self.sha = sha
+        self.size = size
+        self.url = url
+
+
+class GitTree:
+    def __init__(self, sha, url, tree, truncated):
+        self.sha = sha
+        self.url = url
+        self.tree = [GitTreeElement(**tree_item) for tree_item in tree]
+        self.truncated = truncated
+
+    @classmethod
+    def from_response(cls, response):
+        return cls.from_json(json.loads(response.content.decode('utf-8')))
+
+    @classmethod
+    def from_json(cls, json_data):
+        return cls(**json_data)
+
+
+class WlanManager:
+    def __init__(self, wlan_ssid=ssid, wlan_password=password):
+        self.ssid = wlan_ssid
+        self.password = wlan_password
+        # self.wlan = network.WLAN(network.STA_IF)
+        self.wlan.active(False)
+        self.wlan.active(True)
+        self.wlan.connect(self.ssid, self.password)
+        while not self.wlan.isconnected():
+            pass
+        self.is_connected = self.wlan.isconnected
+        self.ifconfig = self.wlan.ifconfig()
+
+
+class GitManager:
     headers = {'User-Agent': 'ota-esp32'}
-    # ^^^ Github Requires user-agent header otherwise 403
-    if len(token) > 0:
-        headers['authorization'] = "bearer %s" % token
-    r = urequests.get(raw_url, headers=headers)
-    try:
-        new_file = open(f_path, 'w')
-        new_file.write(r.content.decode('utf-8'))
-        new_file.close()
-    except:
-        print('decode fail try adding non-code files to .gitignore')
-        try:
-            new_file.close()
-        except:
-            print('tried to close new_file to save memory durring raw file decode')
+
+    def __init__(self, username=user, repo_name=repository, token=token):
+        self.username = username
+        self.repo_name = repo_name
+        self.token = token
+        if self.token != '':
+            self.headers['authorization'] = "bearer %s" % token
+        self.url = f'https://github.com/{self.username}/{self.repo_name}'
+        self.tree_url = f'https://api.github.com/repos/{self.username}/{self.repo_name}/git/trees/main?recursive=1'
+        self.raw = f'https://raw.githubusercontent.com/{self.username}/{self.repo_name}/master/'
+
+        self.tree = self._get_tree()
+
+    def pull_file(self, destination_file_path, file_path):
+        logging.info(f"Pulling {destination_file_path} from github")
+        with open(destination_file_path, 'w') as destination_file:
+            destination_file.write(self._get_file_content(file_path))
+
+    def _get_file_content(self, file_path):
+        logging.info(f"Getting content of {file_path}")
+        return urequests.get(f"{self.raw}/{file_path}", headers=self.headers).content.decode('utf-8')
+
+    def _get_tree(self):
+        response = urequests.get(self.tree_url, headers=self.headers)
+        return GitTree.from_response(response)
 
 
-def pull_all(tree=call_trees_url, raw=raw, ignore=ignore, isconnected=False, reset=False):
-    if not isconnected:
-        wlan = wificonnect()
-    os.chdir('/')
-    tree = pull_git_tree()
-    internal_tree = build_internal_tree()
-    internal_tree = remove_ignore(internal_tree)
-    print(' ignore removed ----------------------')
-    print(internal_tree)
-    log = []
-    # download and save all files
-    for i in tree['tree']:
-        if i['type'] == 'tree':
-            try:
-                os.mkdir(i['path'])
-            except:
-                print(f'failed to {i["path"]} dir may already exist')
-        elif i['path'] not in ignore:
-            try:
-                os.remove(i['path'])
-                log.append(f'{i["path"]} file removed from int mem')
-                internal_tree = remove_item(i['path'], internal_tree)
-            except:
-                log.append(f'{i["path"]} del failed from int mem')
-                print('failed to delete old file')
-            try:
-                pull(i['path'], raw + i['path'])
-                log.append(i['path'] + ' updated')
-            except:
-                log.append(i['path'] + ' failed to pull')
-    # delete files not in Github tree
-    if len(internal_tree) > 0:
-        print(internal_tree, ' leftover!')
-        for i in internal_tree:
-            os.remove(i)
-            log.append(i + ' removed from int mem')
-    logfile = open('ota.log', 'w')
-    logfile.write(str(log))
-    logfile.close()
-    if reset:
-        time.sleep(10)
-        print('resetting machine in 10: machine.reset()')
-        machine.reset()
-        # return check instead return with global
+class OTA:
+    def __init__(self, wlan_ssid=ssid, wlan_password=password,
+                 git_username=user, git_repo=repository, ignore_list=None,
+                 update_url='https://raw.githubusercontent.com/ishamrai/esp32-ota/master/ota.py'):
+        self.update_url = update_url
+        if ignore_list is None:
+            ignore_list = [os.path.normpath(_file) for _file in ignore_files]
+        self.ignore_list = ignore_list
+        # self.wlan = WlanManager(wlan_ssid=wlan_ssid, wlan_password=wlan_password)
+        self.git = GitManager(username=git_username, repo_name=git_repo)
+        self.internal_tree = self.build_internal_tree()
 
+    def _list_dir(self, path):
+        result = []
+        for sub_path in os.listdir(path):
+            _path = os.path.normpath(os.path.join(path, sub_path))
+            if os.path.isfile(_path):
+                result.append(_path)
+            elif os.path.isdir(_path):
+                files = self._list_dir(_path)
+                result.extend(files)
+        return result
 
-def wificonnect(ssid=ssid, password=password):
-    print('Use: like ota.wificonnect(SSID,Password)')
-    print(ssid)
-    print(password)
-    print('otherwise uses ssid,password in top of ota.py code')
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(False)
-    wlan.active(True)
-    wlan.connect(ssid, password)
-    while not wlan.isconnected():
-        pass
-    print('Wifi Connected!!')
-    print(f'SSID: {ssid}')
-    print('Local Ip Address, Subnet Mask, Default Gateway, Listening on...')
-    print(wlan.ifconfig())
-    return wlan
+    def _get_sha(self, file_path):
+        with open(file_path) as rfile:
+            return binascii.hexlify(hashlib.sha1(rfile.read().encode("utf-8")).digest())
 
+    def _filter_ignore_items(self, tree):
+        _tree = []
+        for item in tree:
+            if any(re.match(_ignore, item[0]) for _ignore in self.ignore_list):
+                logging.warning(f"Skip {item[0]} based on ignore list")
+                continue
+            _tree.append(item)
+        return _tree
 
-def build_internal_tree():
-    global internal_tree
-    internal_tree = []
-    os.chdir('/')
-    for i in os.listdir():
-        add_to_tree(i)
-    return (internal_tree)
+    def build_internal_tree(self):
+        tree = self._build_internal_tree()
+        return self._filter_ignore_items(tree)
 
+    def _build_internal_tree(self):
+        return [(_file, self._get_sha(_file)) for _file in self._list_dir('./')]
 
-def add_to_tree(dir_item):
-    global internal_tree
-    if is_directory(dir_item) and len(os.listdir(dir_item)) >= 1:
-        os.chdir(dir_item)
-        for i in os.listdir():
-            add_to_tree(i)
-        os.chdir('..')
-    else:
-        print(dir_item)
-        if os.getcwd() != '/':
-            subfile_path = os.getcwd() + '/' + dir_item
-        else:
-            subfile_path = os.getcwd() + dir_item
-        try:
-            print(f'sub_path: {subfile_path}')
-            internal_tree.append([subfile_path, get_hash(subfile_path)])
-        except OSError:
-            print(f'{dir_item} could not be added to tree')
+    def self_update(self):
+        logging.info('Updating ota.py to newest version')
+        self.git.pull_file('ota.py', self.update_url)
 
+    def pull_repo(self):
+        for item in self.git.tree.tree:
+            if any(re.match(_ignore, item.path) for _ignore in self.ignore_list):
+                logging.warning(f"Skip {item.path} based on ignore list")
 
-def get_hash(file):
-    print(file)
-    o_file = open(file)
-    r_file = o_file.read()
-    sha1obj = hashlib.sha1(r_file)
-    hash = sha1obj.digest()
-    return (binascii.hexlify(hash))
+            if item.type == 'blob':  # file
+                if os.path.exists(item.path):
+                    logging.info(f"Deleting {item.path} file.")
+                    os.remove(item.path)
+                self.git.pull_file(item.path, item.path)
+            elif item.type == 'tree' and not os.path.exists(item.path):  # folder
+                logging.info(f"Creating {item.path} directory.")
+                os.mkdir(item.path)
+            else:
+                logging.error(f"Unexpected git tree item[{item.type}]: {item}")
 
-
-def get_data_hash(data):
-    sha1obj = hashlib.sha1(data)
-    hash = sha1obj.digest()
-    return (binascii.hexlify(hash))
-
-
-def is_directory(file):
-    directory = False
-    try:
-        return (os.stat(file)[8] == 0)
-    except:
-        return directory
-
-
-def pull_git_tree(tree_url=call_trees_url, raw=raw):
-    headers = {'User-Agent': 'ota-esp32'}
-    # ^^^ Github Requires user-agent header otherwise 403
-    if len(token) > 0:
-        headers['authorization'] = "bearer %s" % token
-    r = urequests.get(tree_url, headers=headers)
-    tree = json.loads(r.content.decode('utf-8'))
-    return (tree)
-
-
-def parse_git_tree():
-    tree = pull_git_tree()
-    dirs = []
-    files = []
-    for i in tree['tree']:
-        if i['type'] == 'tree':
-            dirs.append(i['path'])
-        if i['type'] == 'blob':
-            files.append([i['path'], i['sha'], i['mode']])
-    print('dirs:', dirs)
-    print('files:', files)
-
-
-def check_ignore(tree=call_trees_url, raw=raw, ignore=ignore):
-    os.chdir('/')
-    tree = pull_git_tree()
-    check = []
-    # download and save all files
-    for i in tree['tree']:
-        if i['path'] not in ignore:
-            print(i['path'] + ' not in ignore')
-        if i['path'] in ignore:
-            print(i['path'] + ' is in ignore')
-
-
-def remove_ignore(internal_tree, ignore=ignore):
-    clean_tree = []
-    int_tree = []
-    for i in internal_tree:
-        int_tree.append(i[0])
-    for i in int_tree:
-        if i not in ignore:
-            clean_tree.append(i)
-    return (clean_tree)
-
-
-def remove_item(item, tree):
-    culled = []
-    for i in tree:
-        if item not in i:
-            culled.append(i)
-    return (culled)
-
-
-def update():
-    wlan = wificonnect()
-    print('Updating ota.py to newest version')
-    raw_url = 'https://raw.githubusercontent.com/ishamrai/esp32-ota/master/'
-    pull('ota.py', raw_url + 'ota.py')
-
-
-def backup():
-    int_tree = build_internal_tree()
-    backup_text = "ota Backup Version 0.1\n\n"
-    for i in int_tree:
-        data = open(i[0], 'r')
-        backup_text += f'FN:SHA1{i[0]},{i[1]}\n'
-        backup_text += '---' + data.read() + '---\n'
-        data.close()
-    backup = open('ota.backup', 'w')
-    backup.write(backup_text)
-    backup.close()
+    def backup_all(self):
+        full_tree = self._build_internal_tree()
+        with open('ota.backup') as backup:
+            for item in full_tree:
+                with open(item[0], 'r') as target:
+                    backup.write(f'FN:SHA1{item[0]},{item[1]}\n')
+                    backup.write('---' + target.read() + '---\n')
